@@ -329,16 +329,20 @@ class WanVACETransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
             # Prepare VACE hints
             control_hidden_states_list = []
             for i, block in enumerate(self.vace_blocks):
-                conditioning_states, control_hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, control_hidden_states, timestep_proj, rotary_emb
-                )
+                #! 计算图卸载主存
+                with torch.autograd.graph.save_on_cpu():
+                    conditioning_states, control_hidden_states = self._gradient_checkpointing_func(
+                        block, hidden_states, encoder_hidden_states, control_hidden_states, timestep_proj, rotary_emb
+                    )
                 control_hidden_states_list.append((conditioning_states, control_hidden_states_scale[i]))
             control_hidden_states_list = control_hidden_states_list[::-1]
 
             for i, block in enumerate(self.blocks):
-                hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
-                )
+                #! 计算图卸载主存
+                with torch.autograd.graph.save_on_cpu():
+                    hidden_states = self._gradient_checkpointing_func(
+                        block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    )
                 if i in self.config.vace_layers:
                     control_hint, scale = control_hidden_states_list.pop()
                     hidden_states = hidden_states + control_hint * scale

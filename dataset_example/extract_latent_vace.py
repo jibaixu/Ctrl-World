@@ -1,6 +1,6 @@
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import math
 import shutil
 
@@ -46,7 +46,7 @@ class EncodeLatentDataset(Dataset):
         # Remove trajectories which 'length' is too short
         self.data = [traj for traj in self.data if traj['length'] >= 20*rgb_skip]
         if resume:
-            self.data = [traj for traj in self.data if traj['episode_index'] >= resume_traj_id]
+            self.data = [traj for traj in self.data if traj['episode_index'] <= resume_traj_id]
 
     def __len__(self):
         return len(self.data)
@@ -96,7 +96,7 @@ class EncodeLatentDataset(Dataset):
             'action.joint_velocity': action_joint_vel,
         }
         
-        if self.check_traj_file(traj_id, mode):
+        if self.check_traj_file(str(traj_id), mode):
             print(f"\033[1;33mTraj {traj_id} has existed, continue ...\033[0m")
             return 0
         self.process_traj(
@@ -242,10 +242,38 @@ class EncodeLatentDataset(Dataset):
             return False
 
         return True
+    
+    def merge_annotation(self):
+        """
+        工具函数，需自己调用
+        将annotation.json合并成一个，(仅保留视频长度等信息，以便过滤操作)
+        """
+        modes = ['train', 'val']
+        for mode in modes:
+            anno_dict = dict()
+            total_anno_path = os.path.join(self.new_path, "annotation", f"{mode}.json")
+            annotation_dir = os.path.join(self.new_path, "annotation", mode)
+            samples = os.listdir(annotation_dir)
+            for sample in samples:
+                anno_path = os.path.join(annotation_dir, sample)
+                with open(anno_path, 'r', encoding='utf-8') as f:
+                    j = json.load(f)
+                anno_dict[str(j['episode_id'])] = {
+                    'texts': j['texts'],
+                    'success': j['success'],
+                    'video_length': j['video_length'],
+                    'state_length': j['state_length'],
+                    'raw_length': j['raw_length']
+                }
+
+            with open(total_anno_path, "w", encoding="utf-8") as f:
+                json.dump(anno_dict, f, ensure_ascii=False, indent=2)
+            print(f"\033[1;32mSave total annotation file in {total_anno_path}!\033[0m")
 
     def delete_miss_file_traj(self):
         """
-        用于在数据处理完成后进行过滤
+        工具函数，需自己调用
+        用于在数据处理完成后进行过滤，删除缺失文件的traj
         """
         modes = ['train', 'val']
         for mode in modes:
@@ -256,7 +284,7 @@ class EncodeLatentDataset(Dataset):
 
             samples = os.listdir(latent_videos_dir)
             for sample in samples:
-                if self.check_traj_file(sample, mode):
+                if not self.check_traj_file(sample, mode):
                     del_samples.append(sample)
             print(del_samples)
 
@@ -269,22 +297,23 @@ class EncodeLatentDataset(Dataset):
                 else:                       # 是目录
                     shutil.rmtree(path)
 
-            # for sample in del_samples:
-            #     annotation_path = os.path.join(annotation_dir, f"{sample}.json")
-            #     latent_path = os.path.join(latent_videos_dir, sample)
-            #     video_path = os.path.join(videos_dir, sample)
-            #     safe_delete(annotation_path)
-            #     safe_delete(latent_path)
-            #     safe_delete(video_path)
+            for sample in del_samples:
+                annotation_path = os.path.join(annotation_dir, f"{sample}.json")
+                latent_path = os.path.join(latent_videos_dir, sample)
+                video_path = os.path.join(videos_dir, sample)
+                safe_delete(annotation_path)
+                safe_delete(latent_path)
+                safe_delete(video_path)
+                print(f"Delete sample {sample} success!")
 
 
 if __name__ == "__main__":
 
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('--droid_hf_path', type=str, default='/home/jibaixu/Datasets/droid_1.0.1')
-    parser.add_argument('--droid_output_path', type=str, default='dataset_example/droid_vace_dynamic_hz_192_320')
-    parser.add_argument('--model_path', type=str, default='/home/jibaixu/Models/Wan/Wan2.1-VACE-1.3B-diffusers')
+    parser.add_argument('--droid_hf_path', type=str, default='/data2/jibaixu/Datasets/droid_1.0.1')
+    parser.add_argument('--droid_output_path', type=str, default='dataset_example/droid_vace_5hz_192_320_latent')
+    parser.add_argument('--model_path', type=str, default='/data2/jibaixu/Models/Wan-AI/Wan2.1-VACE-1.3B-diffusers')
     # debug
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
@@ -300,9 +329,10 @@ if __name__ == "__main__":
         batch_size=1,
         extract_latent=True,   # 是否进行潜变量压缩
         resume=True,
-        resume_traj_id=25577,
+        resume_traj_id=22613,
         device=accelerator.device,
     )
+    # dataset.merge_annotation()
     # dataset.delete_miss_file_traj()
     tmp_data_loader = torch.utils.data.DataLoader(
             dataset,

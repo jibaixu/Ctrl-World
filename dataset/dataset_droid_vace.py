@@ -1,6 +1,6 @@
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import random
 from typing import List
 
@@ -26,8 +26,6 @@ class Dataset_mix(torch.utils.data.Dataset):
         self.args = args
         self.mode = mode
 
-        # samples:{'ann_file':xxx, 'frame_idx':xxx, 'dataset_name':xxx}
-
         # prepare all datasets path
         self.dataset_path_all = []
         self.samples_all = []
@@ -41,14 +39,19 @@ class Dataset_mix(torch.utils.data.Dataset):
             dataset_path = os.path.join(dataset_root_path, dataset_name)
             self.dataset_path_all.append(dataset_path)
 
-            samples_path = os.path.join(dataset_path, "latent_videos", mode)
-            samples = os.listdir(samples_path)
+            total_anno_path = os.path.join(dataset_path, "annotation", f"{mode}.json")
+
+            with open(total_anno_path, 'r', encoding="utf-8") as f:
+                total_anno_dict = json.load(f)
+
+            # Filter "video_length" less than 100
+            samples = sorted([k for k, v in total_anno_dict.items() if v['video_length'] >= 81 and v['video_length'] < 100])
 
             self.samples_all.append(samples)
             self.samples_len.append(len(samples))
         
         self.max_id = max(self.samples_len)
-        print('samples_len:',self.samples_len, 'max_id:',self.max_id)
+        print(f'\033[1;32m{mode} dataset: samples_len:{self.samples_len}, max_id: {self.max_id}\033[0m')
 
     def __len__(self):
         return self.max_id
@@ -65,13 +68,17 @@ class Dataset_mix(torch.utils.data.Dataset):
         latent_video_dir = os.path.join(dataset_path, "latent_videos", self.mode)
         cam_id = random.choice(range(self.args.num_cams))
         latent_video_path = os.path.join(latent_video_dir, sample, f"{cam_id}.pt")
+        prompt_embed_path = os.path.join(latent_video_dir, sample, "prompt_embeds.pt")
         
-        with open(latent_video_path,'rb') as file:
-            data_dict = torch.load(file)
-        
+        with open(latent_video_path, 'rb') as file:
+            latent_dict = torch.load(file)
+        with open(prompt_embed_path, 'rb') as file:
+            prompt_embeds = torch.load(file)
+        latent_dict["prompt_embeds"] = prompt_embeds
+
         return_dict = dict()
 
-        for k, v in data_dict.items():
+        for k, v in latent_dict.items():
             # Close grad
             v.requires_grad = False
             # Randomly choice a sample from batch
@@ -79,7 +86,7 @@ class Dataset_mix(torch.utils.data.Dataset):
             v = v[np.random.choice(B)]
             # Remove 'batch' dim
             v = v.squeeze()
-
+            
             return_dict[k] = v
 
         """
@@ -93,41 +100,13 @@ class Dataset_mix(torch.utils.data.Dataset):
 
 
 if __name__ == "__main__":
-    from argparse import ArgumentParser
 
-    parser = ArgumentParser()
-    # model parameters
-    parser.add_argument('--vace_model_path', type=str, default="/home/jibaixu/Models/Wan/Wan2.1-VACE-1.3B-diffusers")
-    parser.add_argument('--use_lora', type=bool, default=True)
+    from config_vace import vace_args
 
-    # dataset parameters
-    parser.add_argument('--dataset_root_path', type=str, default="/home/jibaixu/Codes/Ctrl-World/dataset_example")
-    parser.add_argument('--dataset_names', type=str, default="droid_test_vace")
-    parser.add_argument('--probs', type=List[float], default=[1.0], help="probability to sample from each dataset, should sum to 1.0")
-    parser.add_argument('--num_cams', type=int, default=2, help="The number of cameras in one trajectory.")
-
-    # training parameters
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--num_train_epochs', type=int, default=100)
-    parser.add_argument('--train_batch_size', type=int, default=1)
-    parser.add_argument('--max_train_steps', type=int, default=500000)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
-    parser.add_argument('--mixed_precision', type=str, default='fp16')
-    parser.add_argument('--shuffle', type=bool, default=True)
-    parser.add_argument('--checkpointing_steps', type=int, default=20000)
-    parser.add_argument('--validation_steps', type=int, default=2500)
-
-    # log parameters
-    parser.add_argument('--output_dir', type=str, default="output/droid_subset")
-    parser.add_argument('--wandb_project_name', type=str, default="diffusers_wan_vace")
-    parser.add_argument('--wandb_run_name', type=str, default="droid_subset")
-    
-    args = parser.parse_args()
-
-    train_dataset = Dataset_mix(args, mode="train")
+    train_dataset = Dataset_mix(vace_args(), mode="train")
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=args.train_batch_size,
+        batch_size=vace_args.train_batch_size,
         shuffle=True
     )
     for data in tqdm(train_loader, total=len(train_loader)):

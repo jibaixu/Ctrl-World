@@ -1,7 +1,7 @@
 # from diffusers import StableVideoDiffusionPipeline
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import math
 
 import numpy as np
@@ -18,8 +18,37 @@ from models.pipeline_wan_vace import WanVACEPipeline
 from models.wan_vace import WanVACE
 
 
+RED = '\033[31m'
+GREEN = '\033[32m'
+YELLOW = '\033[33m'
+BOLD = '\033[1m'
+RESET = '\033[0m'
+
+
+def init_logging():
+    logger = get_logger(__name__)
+    if logger.logger.hasHandlers():
+        return logger
+
+    accelerator = Accelerator()
+    if accelerator.is_main_process:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '[%(asctime)s] [%(levelname)s] %(name)s: %(message)s',
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        handler.setFormatter(formatter)
+
+        base_logger = logger.logger
+        base_logger.addHandler(handler)
+        base_logger.setLevel(logging.INFO)
+        base_logger.propagate = False
+
+    return logger
+
+
 def main(args):
-    logger = get_logger(__name__, log_level="INFO")
+    logger = init_logging()
     swanlab.sync_wandb()
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -37,17 +66,13 @@ def main(args):
     # logs
     if accelerator.is_main_process:
         now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-        tag = args.dataset_names
-        run_name = f"train_{now}_{tag}"
+        run_name = f"train_{now}_{args.dataset_names}"
         accelerator.init_trackers(args.wandb_project_name, config={}, init_kwargs={"wandb":{"name":run_name}})
+        
         os.makedirs(args.output_dir, exist_ok=True)
-        # count parameters num in each part
-        # num_params = sum(p.numel() for p in model.vae.parameters())
-        # print(f"Number of parameters in the vae: {num_params/1000000:.2f}M")
-        # num_params = sum(p.numel() for p in model.text_encoder.parameters())
-        # print(f"Number of parameters in the text_encoder: {num_params/1000000:.2f}M")
+        
         num_params = sum(p.numel() for p in model.transformer.parameters())
-        print(f"Number of parameters in the transformer: {num_params/1000000:.2f}M")
+        logger.info(f"Number of parameters in the transformer: {num_params/1000000:.2f}M")
 
     # train and val datasets
     from dataset.dataset_droid_vace import Dataset_mix
@@ -71,10 +96,11 @@ def main(args):
 
     ############################ training ##############################
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    num_train_epochs = math.ceil(args.max_train_steps * args.gradient_accumulation_steps * total_batch_size / len(train_dataloader))
+    num_train_epochs = math.ceil(args.max_train_steps * total_batch_size / len(train_dataset))
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Num Epochs (equivalent) = {num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
@@ -82,47 +108,56 @@ def main(args):
     logger.info(f"  checkpointing_steps = {args.checkpointing_steps}")
     logger.info(f"  validation_steps = {args.validation_steps}")
     global_step = 0
-    forward_step=0
     train_loss = 0.0
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    logger.info(f"{GREEN}{BOLD}Total train epochs (equivalent): {num_train_epochs}{RESET}")
+
     for epoch in range(num_train_epochs):
+        if global_step >= args.max_train_steps:
+            break
         for step, batch in enumerate(train_dataloader):
+            if global_step >= args.max_train_steps:
+                break
             with accelerator.accumulate(model):
                 with accelerator.autocast():
                     loss_gen = model(batch)
                 avg_loss = accelerator.gather(loss_gen.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item()/ args.gradient_accumulation_steps
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
                 accelerator.backward(loss_gen)
-                params_to_clip = model.parameters()
+
                 if accelerator.sync_gradients:
+                    params_to_clip = model.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                forward_step += 1
-            
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+            # 只有同步梯度才算一次“优化步”
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                # log loss every 100 steps
-                if global_step %100 == 0:
+
+                # log
+                if global_step % 100 == 0:
                     progress_bar.set_postfix({"loss": train_loss})
-                    accelerator.log({"train_loss": train_loss/100}, step=global_step)
+                    accelerator.log({"train_loss": train_loss / 100}, step=global_step)
                     train_loss = 0.0
-                # save ckpt every checkpointing_steps
+
+                # checkpoint
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.pt")
-                    torch.save(accelerator.unwrap_model(model).state_dict(), save_path)
+                    save_path = os.path.join(args.output_dir, f"Transformer-{global_step}")
+                    accelerator.unwrap_model(model).transformer.save_pretrained(save_path)
                     logger.info(f"Saved checkpoint to {save_path}")
-                # generate video every validation_steps
-                if global_step % args.validation_steps == 5 and accelerator.is_main_process:
-                    continue
-                    model.eval()
-                    with accelerator.autocast():
-                        for id in range(args.video_num):
-                            validate_video_generation(model, val_dataset, args,global_step, args.output_dir, id, accelerator)
-                    model.train()
+
+                # validation（每 N 步做一次，这里改成 !=0 即可）
+                # if global_step % args.validation_steps == 0 and global_step != 0 and accelerator.is_main_process:
+                #     # TODO: 真正验证代码写这里
+                #     model.eval()
+                #     with accelerator.autocast():
+                #         for id in range(args.video_num):
+                #             validate_video_generation(model, val_dataset, args,global_step, args.output_dir, id, accelerator)
+                #     model.train()
 
 
 # def main_val(args):
@@ -220,13 +255,12 @@ def validate_video_generation(model, val_dataset, args, train_steps, videos_dir,
     os.makedirs(f"{videos_dir}/samples", exist_ok=True)
     filename = f"{videos_dir}/samples/train_steps_{train_steps}_{id}.mp4"
     mediapy.write_video(filename, videos, fps=2)
-    return 
+    return
 
 
 if __name__ == "__main__":
     from config_vace import vace_args
 
-    main(vace_args)
+    main(vace_args())
 
-    # CUDA_VISIBLE_DEVICES=0,1 WANDB_MODE=offline accelerate launch --main_process_port 29501 train_wm.py --dataset_root_path dataset_example --dataset_meta_info_path dataset_meta_info
-    # CUDA_VISIBLE_DEVICES=0 accelerate launch --main_process_port 29506 unit_test2.py
+    # accelerate launch --num_processes 2 --main_process_port 29500 --gpu_ids 6,7 scripts/train_vace.py

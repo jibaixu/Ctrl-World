@@ -1,6 +1,6 @@
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ['CUDA_VISIBLE_DEVICES'] = "3"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "7"
 from typing import Union, List
 
 import torch
@@ -9,7 +9,7 @@ from diffusers.models import AutoencoderKLWan
 
 from models.pipeline_wan_vace import WanVACEPipeline
 from models.transformer_wan_vace import WanVACETransformer3DModel
-from models.flow_match import FlowMatchScheduler
+from models.scheduler_flow_match import FlowMatchScheduler
 
 
 class WanVACE(nn.Module):
@@ -18,25 +18,27 @@ class WanVACE(nn.Module):
             vace_model_path: str,
             num_training_timesteps: int = 1000,
             seed: int = 42,
-            use_lora: bool = True,
-            transformer_dtype: torch.dtype = torch.bfloat16
+            use_lora: bool = False,
+            transformer_dtype: torch.dtype = torch.bfloat16,
         ):
         super().__init__()
 
-        vae = AutoencoderKLWan.from_pretrained(vace_model_path, subfolder="vae", torch_dtype=torch.float32)
-        self.pipeline = WanVACEPipeline.from_pretrained(vace_model_path, vae=vae, torch_dtype=transformer_dtype)
-        print("Replace the transformer of WanVACEPipeline ...")
-        self.pipeline.transformer = WanVACETransformer3DModel.from_pretrained(os.path.join(vace_model_path, "transformer"), torch_dtype=transformer_dtype)
+        # vae = AutoencoderKLWan.from_pretrained(vace_model_path, subfolder="vae", torch_dtype=torch.float32)
+        # self.pipeline = WanVACEPipeline.from_pretrained(vace_model_path, vae=vae, torch_dtype=transformer_dtype)
+        # print("Replace the transformer of WanVACEPipeline ...")
+        # self.pipeline.transformer = WanVACETransformer3DModel.from_pretrained(os.path.join(vace_model_path, "transformer"), torch_dtype=transformer_dtype)
+        self.transformer = WanVACETransformer3DModel.from_pretrained(os.path.join(vace_model_path, "transformer"), torch_dtype=transformer_dtype)
+        self.transformer.enable_gradient_checkpointing()
         
-        self.vae = self.pipeline.vae    # 1014MB
-        self.text_encoder = self.pipeline.text_encoder  # 11342MB
-        self.tokenizer = self.pipeline.tokenizer
-        self.transformer = self.pipeline.transformer    # 4972MB
-        self.scheduler = FlowMatchScheduler(sigma_min=0.0, extra_one_step=True)
+        # self.vae = self.pipeline.vae    # 1014MB
+        # self.text_encoder = self.pipeline.text_encoder  # 11342MB
+        # self.tokenizer = self.pipeline.tokenizer
+        # self.transformer = self.pipeline.transformer    # 4972MB
+        # self.scheduler = FlowMatchScheduler(sigma_min=0.0, extra_one_step=True)
 
         # Freeze VAE and text encoder
-        self.vae.requires_grad(False)
-        self.text_encoder.requires_grad(False)
+        # self.vae.requires_grad(False)
+        # self.text_encoder.requires_grad(False)
         if not use_lora:
             self.transformer.requires_grad_(True)
         else:
@@ -144,21 +146,22 @@ class WanVACE(nn.Module):
 
 if __name__ == "__main__":
     model = WanVACE(
-        vace_model_path = "/home/jibaixu/Models/Wan/Wan2.1-VACE-1.3B-diffusers",
-        use_lora=True,
+        vace_model_path = "/data2/jibaixu/Models/Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+        use_lora=False,
     )
-    model.pipeline.save_pretrained(
-        "model_ckpt/doird_subset",
-        max_shard_size="5GB",
-    )
-    latents = torch.randn(8, 16, 21, 64, 64)
-    condition_latents = torch.randn(8, 96, 21, 64, 64)
-    prompt_embeds = torch.randn(8, 512, 4096)
+    # model.transformer.save_pretrained(
+    #     "model_ckpt/doird_subset",
+    #     max_shard_size="5GB",
+    # )
+    latents = torch.randn(1, 16, 21, 24, 40)
+    condition_latents = torch.randn(1, 96, 21, 24, 40)
+    prompt_embeds = torch.randn(1, 512, 4096)
     batch = {
         'latents': latents,
         'condition_latents': condition_latents,
         'prompt_embeds': prompt_embeds,
     }
-    model.transformer.to('cuda:0')
+    model.transformer.train()
+    model.transformer.to('cuda')
     loss = model(batch)
     print(loss)
