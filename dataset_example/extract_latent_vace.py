@@ -1,6 +1,6 @@
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import math
 import shutil
 
@@ -263,7 +263,8 @@ class EncodeLatentDataset(Dataset):
                     'success': j['success'],
                     'video_length': j['video_length'],
                     'state_length': j['state_length'],
-                    'raw_length': j['raw_length']
+                    'raw_length': j['raw_length'],
+                    'latents_starts_info': j['latents_starts_info'],
                 }
 
             with open(total_anno_path, "w", encoding="utf-8") as f:
@@ -332,7 +333,7 @@ if __name__ == "__main__":
         resume_traj_id=22613,
         device=accelerator.device,
     )
-    # dataset.merge_annotation()
+    dataset.merge_annotation()
     # dataset.delete_miss_file_traj()
     tmp_data_loader = torch.utils.data.DataLoader(
             dataset,

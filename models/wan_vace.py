@@ -1,15 +1,23 @@
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# os.environ['CUDA_VISIBLE_DEVICES'] = "7"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 from typing import Union, List
 
 import torch
 import torch.nn as nn
 from diffusers.models import AutoencoderKLWan
+import PIL.Image
 
 from models.pipeline_wan_vace import WanVACEPipeline
 from models.transformer_wan_vace import WanVACETransformer3DModel
 from models.scheduler_flow_match import FlowMatchScheduler
+
+
+RED = '\033[31m'
+GREEN = '\033[32m'
+YELLOW = '\033[33m'
+BOLD = '\033[1m'
+RESET = '\033[0m'
 
 
 class WanVACE(nn.Module):
@@ -18,31 +26,35 @@ class WanVACE(nn.Module):
             vace_model_path: str,
             num_training_timesteps: int = 1000,
             seed: int = 42,
+            trainable_module: str = "vace",
             use_lora: bool = False,
             transformer_dtype: torch.dtype = torch.bfloat16,
         ):
         super().__init__()
 
-        # vae = AutoencoderKLWan.from_pretrained(vace_model_path, subfolder="vae", torch_dtype=torch.float32)
-        # self.pipeline = WanVACEPipeline.from_pretrained(vace_model_path, vae=vae, torch_dtype=transformer_dtype)
-        # print("Replace the transformer of WanVACEPipeline ...")
-        # self.pipeline.transformer = WanVACETransformer3DModel.from_pretrained(os.path.join(vace_model_path, "transformer"), torch_dtype=transformer_dtype)
+        vae = AutoencoderKLWan.from_pretrained(vace_model_path, subfolder="vae", torch_dtype=torch.float32)
+        self.pipeline = WanVACEPipeline.from_pretrained(vace_model_path, vae=vae, torch_dtype=transformer_dtype)
         self.transformer = WanVACETransformer3DModel.from_pretrained(os.path.join(vace_model_path, "transformer"), torch_dtype=transformer_dtype)
         self.transformer.enable_gradient_checkpointing()
         
-        # self.vae = self.pipeline.vae    # 1014MB
-        # self.text_encoder = self.pipeline.text_encoder  # 11342MB
-        # self.tokenizer = self.pipeline.tokenizer
-        # self.transformer = self.pipeline.transformer    # 4972MB
-        # self.scheduler = FlowMatchScheduler(sigma_min=0.0, extra_one_step=True)
-
         # Freeze VAE and text encoder
-        # self.vae.requires_grad(False)
-        # self.text_encoder.requires_grad(False)
-        if not use_lora:
-            self.transformer.requires_grad_(True)
-        else:
+        self.pipeline.vae.requires_grad_(False)
+        self.pipeline.text_encoder.requires_grad_(False)
+        if use_lora:
+            print(f"{YELLOW}{BOLD}[WARNING]{RESET} LORA layer is constructed on the whole transformer.")
             self._enable_transformer_lora()
+        elif trainable_module == "vace":
+            self.transformer.requires_grad_(False)
+            self.transformer.vace_blocks.requires_grad_(True)
+        else:
+            self.transformer.requires_grad_(True)
+
+        print(f"{YELLOW}{BOLD}Replace the transformer of WanVACEPipeline ...{RESET}")
+        self.pipeline.transformer = self.transformer
+        print(f"{YELLOW}{BOLD}Replace the scheduler of WanVACEPipeline ...{RESET}")
+        self.pipeline.scheduler = FlowMatchScheduler(sigma_min=0.0, extra_one_step=True)
+        print(f"{YELLOW}{BOLD}Delete the text_encoder of WanVACEPipeline ...{RESET}")
+        self.pipeline.text_encoder = None
 
         # Training Parameters
         self.num_training_timesteps = num_training_timesteps
@@ -91,6 +103,9 @@ class WanVACE(nn.Module):
         y_shifted = y - y.min()
         linear_timesteps_weights = y_shifted * (num_training_timesteps / y_shifted.sum())
         return linear_timesteps_weights
+    
+    def save_model(self, save_path: str):
+        self.transformer.save_pretrained(save_path)
 
     def forward(
             self,
@@ -100,8 +115,24 @@ class WanVACE(nn.Module):
         device = self.transformer.device
         transformer_dtype = self.transformer.dtype
 
-        latents = batch['latents'].to(dtype=transformer_dtype, device=device)
-        conditioning_latents = batch['condition_latents'].to(dtype=transformer_dtype, device=device)   # [B, 32+patch_h*patch_w, num_ref_imgs+T/4, H/8, W/8]
+        videos = batch['videos']    # torch.tensor(uint8) shape=[T, H, W, C]
+        # torch.tensor --> list[list[PIL.Image]]
+        videos = [[PIL.Image.fromarray(img.numpy()) for img in video] for video in videos.cpu()]
+
+        latents = []
+        condition_latents = []
+        for video in videos:
+            latent, condition_latent = self.pipeline.construct_latents_from_video(
+                video=video[:21],
+                generator=self.generator,
+                device=device
+            )
+            latents.append(latent)
+            condition_latents.append(condition_latent)
+        latents = torch.cat(latents, dim=0).to(dtype=transformer_dtype, device=device)
+        condition_latents = torch.cat(condition_latents, dim=0).to(dtype=transformer_dtype, device=device)
+        # latents = batch['latents'].to(dtype=transformer_dtype, device=device)
+        # condition_latents = batch['condition_latents'].to(dtype=transformer_dtype, device=device)   # [B, 32+patch_h*patch_w, num_ref_imgs+T/4, H/8, W/8]
         prompt_embeds = batch['prompt_embeds'].to(dtype=transformer_dtype, device=device)
         
         # Construct conditioning_scale dtype and device
@@ -126,11 +157,11 @@ class WanVACE(nn.Module):
         noisy_latents = (1 - sigma) * latents + sigma * noise
         timestep = (sigma * self.num_training_timesteps).reshape(sigma.shape[0]).to(torch.long)
 
-        noise_pred = self.transformer(
+        model_pred = self.transformer(
             hidden_states=noisy_latents,
             timestep=timestep,
             encoder_hidden_states=prompt_embeds,
-            control_hidden_states=conditioning_latents,
+            control_hidden_states=condition_latents,
             control_hidden_states_scale=conditioning_scale,
             return_dict=False,
         )[0]
@@ -140,7 +171,7 @@ class WanVACE(nn.Module):
         if self.training_weights.device is not device:
             self.training_weights = self.training_weights.to(device)
         training_weight = self.training_weights[timestep].reshape(sigma.shape[0], 1, 1, 1, 1)
-        loss = (training_weight * (noise_pred - target) ** 2).mean()
+        loss = (training_weight * (model_pred.float() - target.float()) ** 2).mean()
         return loss
 
 
@@ -153,15 +184,17 @@ if __name__ == "__main__":
     #     "model_ckpt/doird_subset",
     #     max_shard_size="5GB",
     # )
+    videos = (torch.randn(1, 81, 192, 320, 3)*255).to(torch.uint8)
     latents = torch.randn(1, 16, 21, 24, 40)
     condition_latents = torch.randn(1, 96, 21, 24, 40)
     prompt_embeds = torch.randn(1, 512, 4096)
     batch = {
+        'videos': videos,
         'latents': latents,
         'condition_latents': condition_latents,
         'prompt_embeds': prompt_embeds,
     }
+    model.pipeline.to('cuda')
     model.transformer.train()
-    model.transformer.to('cuda')
     loss = model(batch)
     print(loss)

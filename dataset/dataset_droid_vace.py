@@ -1,13 +1,13 @@
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-import random
-from typing import List
 
 import torch
 import numpy as np
 import json
 from tqdm import tqdm
+import mediapy
+import PIL.Image
 
 
 class Dataset_mix(torch.utils.data.Dataset):
@@ -42,10 +42,11 @@ class Dataset_mix(torch.utils.data.Dataset):
             total_anno_path = os.path.join(dataset_path, "annotation", f"{mode}.json")
 
             with open(total_anno_path, 'r', encoding="utf-8") as f:
-                total_anno_dict = json.load(f)
+                self.total_anno_dict = json.load(f)
 
             # Filter "video_length" less than 100
-            samples = sorted([k for k, v in total_anno_dict.items() if v['video_length'] >= 81 and v['video_length'] < 100])
+            if self.args.filter_length:
+                samples = sorted([k for k, v in self.total_anno_dict.items() if v['video_length'] >= self.args.min_len and v['video_length'] <= self.args.max_len])
 
             self.samples_all.append(samples)
             self.samples_len.append(len(samples))
@@ -65,11 +66,16 @@ class Dataset_mix(torch.utils.data.Dataset):
         index = index % len(samples)
         sample = samples[index]
 
+        video_dir = os.path.join(dataset_path, "videos", self.mode)
         latent_video_dir = os.path.join(dataset_path, "latent_videos", self.mode)
-        cam_id = random.choice(range(self.args.num_cams))
+        # cam_id = random.choice(range(self.args.num_cams))
+        cam_id = 0
+        video_path = os.path.join(video_dir, sample, f"{cam_id}.mp4")
         latent_video_path = os.path.join(latent_video_dir, sample, f"{cam_id}.pt")
         prompt_embed_path = os.path.join(latent_video_dir, sample, "prompt_embeds.pt")
         
+        video = mediapy.read_video(video_path)
+        video = torch.tensor(video)
         with open(latent_video_path, 'rb') as file:
             latent_dict = torch.load(file)
         with open(prompt_embed_path, 'rb') as file:
@@ -77,6 +83,7 @@ class Dataset_mix(torch.utils.data.Dataset):
         latent_dict["prompt_embeds"] = prompt_embeds
 
         return_dict = dict()
+        return_dict["videos"] = video
 
         for k, v in latent_dict.items():
             # Close grad
@@ -91,6 +98,7 @@ class Dataset_mix(torch.utils.data.Dataset):
 
         """
         return_dict = {
+            "videos"    # [T, H, W, C] torch.tensor(uint8)
             "prompt_embeds"     # [num_tokens, dim]
             "latents"   # [C, T, H, W]
             "condition_latents" # [C, T, H, W]

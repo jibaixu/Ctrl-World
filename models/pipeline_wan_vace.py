@@ -546,7 +546,8 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 reference_latent = retrieve_latents(self.vae.encode(reference_image), generator, sample_mode="argmax")
                 reference_latent = ((reference_latent.float() - latents_mean) * latents_std).to(vae_dtype)
                 reference_latent = reference_latent.squeeze(0)  # [C, 1, H, W]
-                reference_latent = torch.cat([reference_latent, torch.zeros_like(reference_latent)], dim=0)
+                if reference_latent.shape[0] != latents.shape[1]:
+                    reference_latent = torch.cat([reference_latent, torch.zeros_like(reference_latent)], dim=0)
                 latent = torch.cat([reference_latent.squeeze(0), latent], dim=1)
             latent_list.append(latent)
         return torch.stack(latent_list)
@@ -675,15 +676,18 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         num_frames = len(video)
         width, height = video[0].size
         condition_video = [video[0]] + [PIL.Image.new("RGB", (width, height), (128, 128, 128))] * (num_frames - 1)
+        # condition_video = [video[0]] * num_frames
+        # condition_video = video
+        reference_images = [video[0]]
 
         mask_black = PIL.Image.new("L", (width, height), 0)
         mask_white = PIL.Image.new("L", (width, height), 255)
         mask = [mask_black, *[mask_white] * (num_frames - 1)]
 
-        video, _, _ = self.preprocess_conditions(
+        video, _, ref_images = self.preprocess_conditions(
             video,
             None,
-            reference_images=None,
+            reference_images=reference_images,
             batch_size=1,
             height=height,
             width=width,
@@ -691,10 +695,12 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             dtype=torch.float32,
             device=device,
         )
-        condition_video, mask, reference_images = self.preprocess_conditions(
+        latents = self.prepare_video_latents(video, None, ref_images, generator, device)
+
+        condition_video, mask, ref_images = self.preprocess_conditions(
             condition_video,
             mask,
-            reference_images=None,
+            reference_images=reference_images,
             batch_size=1,
             height=height,
             width=width,
@@ -702,9 +708,9 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             dtype=torch.float32,
             device=device,
         )
-        latents = self.prepare_video_latents(video, None, reference_images, generator, device)
-        conditioning_latents = self.prepare_video_latents(video, mask, reference_images, generator, device)
-        mask = self.prepare_masks(mask, reference_images, generator)
+        conditioning_latents = self.prepare_video_latents(condition_video, mask, ref_images, generator, device)
+
+        mask = self.prepare_masks(mask, ref_images, generator)
         conditioning_latents = torch.cat([conditioning_latents, mask], dim=1)
 
         return latents, conditioning_latents
